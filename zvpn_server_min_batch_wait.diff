@@ -1,0 +1,236 @@
+--- a/zvpn_server.c
++++ b/zvpn_server.c
+@@ -209,6 +209,9 @@
+     size_t max_batch_bytes;
+     size_t out_batch_target_bytes;
+     size_t min_compress_batch_bytes;
++    /* If nonzero, under-minimum batches may wait this long (total age) to fill.
++     * This only extends flush_timeout_ms when the batch is below the Zstd minimum. */
++    int min_batch_wait_ms;
+     int flush_timeout_ms;
+     int compression_level;
+     int auto_benchmark_seconds;
+@@ -377,6 +380,7 @@
+     size_t max_batch_bytes;
+     size_t out_batch_target_bytes;
+     size_t min_compress_batch_bytes;
++    int min_batch_wait_ms;
+     int flush_timeout_ms;
+     int compression_level;
+     int compression_enabled;
+@@ -540,6 +544,7 @@
+     /* Separate locks, in the same order used by the tuner, avoid lock inversion. */
+     mutex_lock(&app->clients_lock);
+     r.out_batch_target_bytes = app->config.out_batch_target_bytes;
++    r.min_batch_wait_ms = app->config.min_batch_wait_ms;
+     r.flush_timeout_ms = app->config.flush_timeout_ms;
+     mutex_unlock(&app->clients_lock);
+     r.max_batch_bytes = app->config.max_batch_bytes; /* immutable after startup */
+@@ -2316,6 +2321,24 @@
+     return 0;
+ }
+ 
++/* Called while clients_lock is held. Lock ordering is clients_lock -> log_lock,
++ * matching the TUN batch and auto-tuner paths. The wait is bounded: a batch
++ * below --min-batch can be held past --flush-ms only until --min-batch-wait-ms. */
++static uint64_t client_batch_timeout_locked(App *app, Client *client) {
++    uint64_t timeout = (uint64_t)app->config.flush_timeout_ms;
++    if (timeout == 0 || app->config.min_batch_wait_ms <= app->config.flush_timeout_ms ||
++        !client || !client->out_used) return timeout;
++
++    size_t min_compress_bytes;
++    mutex_lock(&app->log_lock);
++    min_compress_bytes = app->config.min_compress_batch_bytes;
++    mutex_unlock(&app->log_lock);
++
++    if (min_compress_bytes > 0 && client->out_used < min_compress_bytes)
++        timeout = (uint64_t)app->config.min_batch_wait_ms;
++    return timeout;
++}
++
+ static int client_flush_wait_ms(App *app) {
+     int wait_ms = ZVPN_TUN_WAIT_MS;
+     uint64_t now = monotonic_ms();
+@@ -2323,7 +2346,8 @@
+     for (size_t i = 0; i < ZVPN_MAX_CLIENTS; ++i) {
+         Client *c = app->clients[i];
+         if (!c || !c->out_used) continue;
+-        uint64_t deadline = c->out_batch_started_ms + (uint64_t)app->config.flush_timeout_ms;
++        uint64_t timeout = client_batch_timeout_locked(app, c);
++        uint64_t deadline = c->out_batch_started_ms + timeout;
+         int remain = deadline <= now ? 0 : (deadline - now > (uint64_t)INT_MAX ? INT_MAX : (int)(deadline - now));
+         if (remain < wait_ms) wait_ms = remain;
+     }
+@@ -2336,7 +2360,9 @@
+     mutex_lock(&app->clients_lock);
+     for (size_t i = 0; i < ZVPN_MAX_CLIENTS; ++i) {
+         Client *c = app->clients[i];
+-        if (c && c->out_used && now >= c->out_batch_started_ms + (uint64_t)app->config.flush_timeout_ms)
++        if (!c || !c->out_used) continue;
++        uint64_t timeout = client_batch_timeout_locked(app, c);
++        if (now >= c->out_batch_started_ms + timeout)
+             (void)flush_client_batch_locked(app, c);
+     }
+     mutex_unlock(&app->clients_lock);
+@@ -2345,9 +2371,10 @@
+ THREAD_ENTRY(tun_to_clients_worker) {
+     App *app = (App *)opaque;
+     uint8_t packet[ZVPN_MAX_IP_PACKET];
+-    log_message(app, LOG_INFO, "Shared TUN reader started (download target=%zu bytes; buffer/protocol ceiling=%zu; min-Zstd=%zu; flush=%d ms)",
++    log_message(app, LOG_INFO, "Shared TUN reader started (download target=%zu bytes; buffer/protocol ceiling=%zu; min-Zstd=%zu; under-min wait=%d ms; flush=%d ms)",
+                 app->config.out_batch_target_bytes, app->config.max_batch_bytes,
+-                app->config.min_compress_batch_bytes, app->config.flush_timeout_ms);
++                app->config.min_compress_batch_bytes, app->config.min_batch_wait_ms,
++                app->config.flush_timeout_ms);
+     while (app_running()) {
+         size_t packet_len = 0;
+         int rc = tun_read_packet(app, packet, sizeof(packet), client_flush_wait_ms(app), &packet_len);
+@@ -2673,6 +2700,8 @@
+         "  --batch-size BYTES       Alias for --max-batch; also initial download target\n"
+         "  --min-batch BYTES        Skip Zstd below this batch size; 0=always try (default 0)\n"
+         "  --min-compress-batch N   Alias for --min-batch\n"
++        "  --min-batch-wait-ms MS   While below --min-batch, extend flush age up to MS (0=off)\n"
++        "                            bounded total age; requires MS > --flush-ms and min-batch > 0\n"
+         "  --flush-ms MS            Download batch max age, 0..60000 ms (default 20)\n"
+         "  --compression-level N    Download Zstd level (default 3; higher uses more CPU)\n"
+         "  --auto-benchmark SEC     Auto-test 8 live profiles in SEC total seconds (60..3600)\n"
+@@ -2693,6 +2722,7 @@
+         "  TUN: 10.0.0.2/24; client subnet: 10.0.0.0/24; MTU: 1500\n"
+         "  Download batching: max 262144 bytes (256 KiB), flush age 20 ms\n"
+         "  Minimum size for Zstd attempt: 0 bytes (attempt all batch sizes)\n"
++        "  Under-minimum wait: off; when enabled, wait for min-batch until its bounded deadline\n"
+         "  Download compression: enabled, Zstandard level 3; non-smaller output is sent raw\n"
+         "  Automatic benchmark: 8 profiles, equal time slices, actual live traffic required\n"
+         "  TUI: enabled when attached to a terminal; verbose: off; log: zvpn-server.log\n"
+@@ -2743,6 +2773,7 @@
+     c->max_batch_bytes = ZVPN_DEFAULT_BATCH;
+     c->out_batch_target_bytes = ZVPN_DEFAULT_BATCH;
+     c->min_compress_batch_bytes = 0;
++    c->min_batch_wait_ms = 0;
+     c->flush_timeout_ms = 20;
+     c->compression_level = 3;
+     c->compression_enabled = 1;
+@@ -2778,7 +2809,7 @@
+         } else if (!strcmp(a, "--bind") || !strcmp(a, "--port") ||
+                    !strcmp(a, "--tun-name") || !strcmp(a, "--wintun-dll") ||
+                    !strcmp(a, "--max-batch") || !strcmp(a, "--batch-size") || !strcmp(a, "--min-batch") ||
+-                   !strcmp(a, "--min-compress-batch") || !strcmp(a, "--flush-ms") ||
++                   !strcmp(a, "--min-compress-batch") || !strcmp(a, "--min-batch-wait-ms") || !strcmp(a, "--flush-ms") ||
+                    !strcmp(a, "--compression-level") || !strcmp(a, "--auto-benchmark") || !strcmp(a, "--log-file") ||
+                    !strcmp(a, "--allow-client") || !strcmp(a, "--wan-interface") ||
+                    !strcmp(a, "--tun-ipv4") || !strcmp(a, "--client-subnet") ||
+@@ -2805,6 +2836,9 @@
+             } else if (!strcmp(a, "--min-batch") || !strcmp(a, "--min-compress-batch")) {
+                 if (parse_long(v, 0, ZVPN_MAX_BATCH, &n) < 0) return -1;
+                 c->min_compress_batch_bytes = (size_t)n;
++            } else if (!strcmp(a, "--min-batch-wait-ms")) {
++                if (parse_long(v, 0, 60000, &n) < 0) return -1;
++                c->min_batch_wait_ms = (int)n;
+             } else if (!strcmp(a, "--auto-benchmark")) {
+                 if (parse_long(v, 60, 3600, &n) < 0) return -1;
+                 c->auto_benchmark_seconds = (int)n;
+@@ -2843,6 +2877,20 @@
+         fprintf(stderr, "--min-batch cannot exceed --batch-size/--max-batch ceiling (%zu bytes)\n", c->max_batch_bytes);
+         return -1;
+     }
++    if (c->min_batch_wait_ms > 0) {
++        if (c->min_compress_batch_bytes == 0) {
++            fprintf(stderr, "--min-batch-wait-ms requires --min-batch greater than 0\n");
++            return -1;
++        }
++        if (c->flush_timeout_ms == 0 || c->min_batch_wait_ms <= c->flush_timeout_ms) {
++            fprintf(stderr, "--min-batch-wait-ms must be greater than --flush-ms, and --flush-ms must be greater than 0\n");
++            return -1;
++        }
++        if (c->min_compress_batch_bytes > c->out_batch_target_bytes) {
++            fprintf(stderr, "--min-batch must not exceed the initial --batch-size when minimum waiting is enabled\n");
++            return -1;
++        }
++    }
+     return 0;
+ }
+ 
+@@ -3021,9 +3069,10 @@
+             results[best_index].profile.flush_ms, results[best_index].profile.level,
+             results[best_index].profile.min_compress_bytes);
+         log_message(app, LOG_INFO,
+-            "[AUTO][SAVE] add to startup args: --batch-size %zu --flush-ms %d --compression-level %d --min-batch %zu",
++            "[AUTO][SAVE] add to startup args: --batch-size %zu --flush-ms %d --compression-level %d --min-batch %zu --min-batch-wait-ms %d",
+             results[best_index].profile.batch_bytes, results[best_index].profile.flush_ms,
+-            results[best_index].profile.level, results[best_index].profile.min_compress_bytes);
++            results[best_index].profile.level, results[best_index].profile.min_compress_bytes,
++            app->config.min_batch_wait_ms);
+         log_message(app, LOG_WARN,
+             "[AUTO] winner is based on sequential live traffic, not identical replay; repeat the same workload before treating it as definitive");
+     } else if (app_running()) {
+@@ -3089,8 +3138,9 @@
+     double pct = orig ? 100.0 * (double)saved / (double)orig : 0.0;
+     double avg = s.batches_sent ? (double)orig / (double)s.batches_sent : 0.0;
+     log_message(app, LOG_INFO,
+-        "[DIAG] DL original=%" PRIu64 " encoded=%" PRIu64 " saved=%" PRIu64 " savings=%.2f%% batches=%" PRIu64 " avg_batch=%.1fKiB",
+-        orig, s.payload_encoded_bytes_sent, saved, pct, s.batches_sent, avg / 1024.0);
++        "[DIAG] DL original=%" PRIu64 " encoded=%" PRIu64 " saved=%" PRIu64 " savings=%.2f%% batches=%" PRIu64 " avg_batch=%.1fKiB min-Zstd=%zu under-min-wait=%dms flush=%dms",
++        orig, s.payload_encoded_bytes_sent, saved, pct, s.batches_sent, avg / 1024.0,
++        cfg.min_compress_batch_bytes, cfg.min_batch_wait_ms, cfg.flush_timeout_ms);
+     log_message(app, LOG_INFO,
+         "[DIAG] RX batches=%" PRIu64 " compressed=%" PRIu64 " decode_ms=%" PRIu64
+         " | TX batches=%" PRIu64 " compressed=%" PRIu64 " attempts=%" PRIu64 " compress_ms=%" PRIu64 " skipped-small=%" PRIu64,
+@@ -3266,10 +3316,10 @@
+         tui_row_style(TUI_STYLE_BLUE, 1, "CLIENT MONITOR: no sessions yet");
+     }
+     RuntimeSettings compact_cfg = runtime_settings_snapshot(app);
+-    tui_row_style(TUI_STYLE_MUTED, 1, "Config: level %d | compression %s | target %zu | min %zu | flush %dms | verbose %s",
++    tui_row_style(TUI_STYLE_MUTED, 1, "Config: level %d | compression %s | target %zu | min %zu | wait %dms | flush %dms | verbose %s",
+                   compact_cfg.compression_level, compression_display ? "ON" : "OFF",
+                   compact_cfg.out_batch_target_bytes, compact_cfg.min_compress_batch_bytes,
+-                  compact_cfg.flush_timeout_ms, verbose_display ? "ON" : "OFF");
++                  compact_cfg.min_batch_wait_ms, compact_cfg.flush_timeout_ms, verbose_display ? "ON" : "OFF");
+     ResourceUsage compact_ru = resource_usage_snapshot(app);
+     char compact_rss[32], compact_peak[32];
+     format_bytes(compact_ru.rss_bytes, compact_rss, sizeof(compact_rss));
+@@ -3295,7 +3345,7 @@
+ #else
+         tui_row_style(TUI_STYLE_NORMAL, 1, "TUN zvpn0 | tunnel IP 10.0.0.2/24 | client subnet 10.0.0.0/24");
+ #endif
+-        tui_row_style(TUI_STYLE_NORMAL, 1, "MTU 1500 | batch 262144 bytes | flush 20 ms | min-Zstd 0 bytes");
++        tui_row_style(TUI_STYLE_NORMAL, 1, "MTU 1500 | batch 262144 bytes | flush 20 ms | min-Zstd 0 | wait-min 0 ms");
+         tui_row_style(TUI_STYLE_NORMAL, 1, "Zstd ON at level 3 | verbose OFF | CPU/RSS in dashboard | log zvpn-server.log");
+ #if defined(__linux__) || defined(_WIN32)
+         tui_row_style(TUI_STYLE_NORMAL, 1, "Automatic IPv4 network setup ON by default; root/Admin required.");
+@@ -3446,8 +3496,8 @@
+     if (auto_active && auto_index == 0) (void)snprintf(auto_status, sizeof(auto_status), "WAITING traffic");
+     else if (auto_active) (void)snprintf(auto_status, sizeof(auto_status), "%d/%d", auto_index, auto_count);
+     else (void)snprintf(auto_status, sizeof(auto_status), "%s", auto_done ? "FINISHED" : "idle (A)");
+-    tui_row_style(TUI_STYLE_NORMAL, 1, "Minimum size for Zstd: %zu bytes | auto-tune: %s",
+-                  min_compress, auto_status);
++    tui_row_style(TUI_STYLE_NORMAL, 1, "Min Zstd %zu bytes | wait-under-min %dms (0=off) | auto-tune: %s",
++                  min_compress, cfg.min_batch_wait_ms, auto_status);
+     tui_border(1);
+     tui_row_style(TUI_STYLE_SECTION, 1, "UPLOAD / CLIENT -> SERVER (client performs compression)");
+     tui_row_style(TUI_STYLE_NORMAL, 1, "O %s | E %s | saved %s | savings %.2f%%", up_o, up_e, up_s, up_pct);
+@@ -3606,10 +3656,10 @@
+                   s.packets_received_from_client, s.packets_sent_to_client, s.rejected_packets);
+     RuntimeSettings dashboard_cfg = runtime_settings_snapshot(app);
+     tui_row_style(TUI_STYLE_MUTED, 1,
+-                  "Config: level=%-2d compression=%-3s target=%-8zu min-Zstd=%-7zu flush=%-5dms",
++                  "Config: level=%-2d compression=%-3s target=%-8zu min-Zstd=%-7zu wait=%-5dms flush=%-5dms",
+                   dashboard_cfg.compression_level, compression_display ? "on" : "off",
+                   dashboard_cfg.out_batch_target_bytes, dashboard_cfg.min_compress_batch_bytes,
+-                  dashboard_cfg.flush_timeout_ms);
++                  dashboard_cfg.min_batch_wait_ms, dashboard_cfg.flush_timeout_ms);
+     ResourceUsage ru = resource_usage_snapshot(app);
+     char rss_text[32], peak_text[32];
+     format_bytes(ru.rss_bytes, rss_text, sizeof(rss_text));
+@@ -3964,10 +4014,10 @@
+     (void)signal(SIGPIPE, SIG_IGN);
+ #endif
+     log_message(&app, LOG_INFO,
+-                "Starting ZVPN server: bind=%s port=%d batch-ceiling=%zu download-target=%zu min-Zstd=%zu flush=%dms zstd-level=%d compression=%s auto-network=%s mtu=%d",
++                "Starting ZVPN server: bind=%s port=%d batch-ceiling=%zu download-target=%zu min-Zstd=%zu min-wait=%dms flush=%dms zstd-level=%d compression=%s auto-network=%s mtu=%d",
+                 app.config.bind_address, app.config.port, app.config.max_batch_bytes,
+                 app.config.out_batch_target_bytes, app.config.min_compress_batch_bytes,
+-                app.config.flush_timeout_ms, app.config.compression_level,
++                app.config.min_batch_wait_ms, app.config.flush_timeout_ms, app.config.compression_level,
+                 app.config.compression_enabled ? "on" : "off",
+                 app.config.auto_network ? "on" : "off", app.config.mtu);
+ 
